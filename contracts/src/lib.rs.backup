@@ -1,0 +1,1074 @@
+use anchor_lang::prelude::*;
+
+pub mod parimutuel;
+
+declare_id!("5rw87nNYE9Ep7zv6Yv8adK86fP8MSSYRAMq276C8Dbkq");
+
+#[program]
+pub mod mememarket {
+    use super::*;
+
+    /// Initialize a new parimutuel market with oracle resolution
+    /// Debug: Creates market with SOL-based pricing
+    pub fn initialize_market(
+        ctx: Context<InitializeMarket>,
+        market_id: Pubkey,
+        token_mint: Pubkey,
+        target_market_cap: u64,
+        expiry_time: i64,
+        question: String,
+        one_dollar_lamports: u64, // SOL equivalent of $1
+    ) -> Result<()> {
+        let market = &mut ctx.accounts.market;
+        
+        market.authority = ctx.accounts.authority.key();
+        market.market_id = market_id;
+        market.token_mint = token_mint;
+        market.target_market_cap = target_market_cap;
+        market.current_market_cap = 0;
+        market.expiry_time = expiry_time;
+        market.question = question;
+        market.status = MarketStatus::Active;
+        market.winning_outcome = MarketOutcome::Pending;
+        market.yes_shares_supply = 0;
+        market.no_shares_supply = 0;
+        market.yes_order_count = 0;
+        market.no_order_count = 0;
+        market.total_volume_lamports = 0;
+        market.last_yes_price = PRICE_PRECISION / 2; // Start at 50%
+        market.last_no_price = PRICE_PRECISION / 2;  // Start at 50%
+        market.one_dollar_lamports = if one_dollar_lamports > 0 { 
+            one_dollar_lamports 
+        } else { 
+            DEFAULT_ONE_DOLLAR_LAMPORTS 
+        };
+        market.created_at = Clock::get()?.unix_timestamp;
+        market.resolved_at = 0;
+        
+        // Debug: Log market initialization
+        msg!("DEBUG: Market initialized - ID: {:?}", market_id);
+        msg!("DEBUG: 1 USD = {} lamports", market.one_dollar_lamports);
+        
+        emit!(MarketInitialized {
+            market_id,
+            authority: ctx.accounts.authority.key(),
+            token_mint,
+            target_market_cap,
+            expiry_time,
+            one_dollar_lamports: market.one_dollar_lamports,
+        });
+        
+        Ok(())
+    }
+
+    /// Update SOL/USD price for the market
+    /// Debug: Allows oracle or admin to update the exchange rate
+    pub fn update_sol_price(
+        ctx: Context<UpdateSolPrice>,
+        market_id: Pubkey,
+        new_one_dollar_lamports: u64,
+    ) -> Result<()> {
+        let market = &mut ctx.accounts.market;
+        
+        require!(
+            ctx.accounts.authority.key() == market.authority,
+            ErrorCode::Unauthorized
+        );
+        require!(new_one_dollar_lamports > 0, ErrorCode::InvalidAmount);
+        
+        let old_price = market.one_dollar_lamports;
+        market.one_dollar_lamports = new_one_dollar_lamports;
+        
+        // Debug: Log price update
+        msg!("DEBUG: SOL price updated from {} to {} lamports/$1", old_price, new_one_dollar_lamports);
+        
+        emit!(SolPriceUpdated {
+            market_id,
+            old_lamports_per_dollar: old_price,
+            new_lamports_per_dollar: new_one_dollar_lamports,
+        });
+        
+        Ok(())
+    }
+
+    /// Place a limit order to buy YES or NO shares (SOL-based)
+    /// Core Polymarket rule: YES price + NO price = $1
+    /// Debug: Creates order with SOL collateral
+    pub fn place_order(
+        ctx: Context<PlaceOrder>,
+        market_id: Pubkey,
+        order_id: Pubkey,
+        side: OrderSide,      // YES or NO
+        price: u64,           // Price in PRICE_PRECISION units (0-1_000_000)
+        quantity: u64,        // Number of shares to buy
+    ) -> Result<()> {
+        let market = &mut ctx.accounts.market;
+        let order = &mut ctx.accounts.order;
+        let user = &ctx.accounts.user;
+        
+        require!(market.status == MarketStatus::Active, ErrorCode::MarketNotActive);
+        require!(market.expiry_time > Clock::get()?.unix_timestamp, ErrorCode::MarketExpired);
+        require!(price > 0 && price < PRICE_PRECISION, ErrorCode::InvalidPrice);
+        require!(quantity > 0, ErrorCode::InvalidAmount);
+        
+        // Calculate required SOL collateral
+        // cost = (price / PRICE_PRECISION) * quantity * one_dollar_lamports
+        let cost_lamports = price
+            .checked_mul(quantity)
+            .ok_or(ErrorCode::MathOverflow)?
+            .checked_mul(market.one_dollar_lamports)
+            .ok_or(ErrorCode::MathOverflow)?
+            .checked_div(PRICE_PRECISION)
+            .ok_or(ErrorCode::MathOverflow)?;
+        
+        // Debug: Log order details
+        msg!("DEBUG: Placing {} order - price: {}, qty: {}, cost: {} lamports", 
+            if side == OrderSide::Yes { "YES" } else { "NO" },
+            price, quantity, cost_lamports);
+        
+        // Transfer SOL from user to vault
+        let cpi_context = CpiContext::new(
+            ctx.accounts.system_program.to_account_info(),
+            system_program::Transfer {
+                from: user.to_account_info(),
+                to: ctx.accounts.vault.to_account_info(),
+            },
+        );
+        system_program::transfer(cpi_context, cost_lamports)?;
+        
+        // Initialize order
+        order.order_id = order_id;
+        order.owner = user.key();
+        order.market_id = market_id;
+        order.side = side.clone();
+        order.price = price;
+        order.original_quantity = quantity;
+        order.filled_quantity = 0;
+        order.remaining_quantity = quantity;
+        order.lamports_deposited = cost_lamports;
+        order.status = OrderStatus::Open;
+        order.is_sell = false;
+        order.created_at = Clock::get()?.unix_timestamp;
+        
+        // Update market order counts
+        match side {
+            OrderSide::Yes => market.yes_order_count += 1,
+            OrderSide::No => market.no_order_count += 1,
+        }
+        
+        emit!(OrderPlaced {
+            order_id,
+            owner: user.key(),
+            market_id,
+            side,
+            price,
+            quantity,
+            cost_lamports,
+        });
+        
+        Ok(())
+    }
+
+    /// Match orders: When YES price + NO price = $1, mint shares
+    /// This is the core Polymarket mechanism
+    /// Debug: Matches complementary orders and mints shares to buyers
+    pub fn match_orders(
+        ctx: Context<MatchOrders>,
+        market_id: Pubkey,
+    ) -> Result<()> {
+        let market = &mut ctx.accounts.market;
+        let yes_order = &mut ctx.accounts.yes_order;
+        let no_order = &mut ctx.accounts.no_order;
+        let yes_shares = &mut ctx.accounts.yes_user_shares;
+        let no_shares = &mut ctx.accounts.no_user_shares;
+        
+        require!(market.status == MarketStatus::Active, ErrorCode::MarketNotActive);
+        require!(yes_order.side == OrderSide::Yes, ErrorCode::InvalidOrderSide);
+        require!(no_order.side == OrderSide::No, ErrorCode::InvalidOrderSide);
+        require!(yes_order.status == OrderStatus::Open || yes_order.status == OrderStatus::PartiallyFilled, ErrorCode::OrderNotOpen);
+        require!(no_order.status == OrderStatus::Open || no_order.status == OrderStatus::PartiallyFilled, ErrorCode::OrderNotOpen);
+        require!(yes_order.market_id == market_id && no_order.market_id == market_id, ErrorCode::MarketMismatch);
+        
+        // Core rule: YES price + NO price must equal $1 (PRICE_PRECISION)
+        let combined_price = yes_order.price.checked_add(no_order.price)
+            .ok_or(ErrorCode::MathOverflow)?;
+        
+        require!(combined_price == PRICE_PRECISION, ErrorCode::PricesMustSumToOne);
+        
+        // Calculate match quantity (minimum of both remaining)
+        let match_quantity = std::cmp::min(
+            yes_order.remaining_quantity,
+            no_order.remaining_quantity
+        );
+        
+        require!(match_quantity > 0, ErrorCode::NoMatchQuantity);
+        
+        // Debug: Log match
+        msg!("DEBUG: Matching - YES: {}@{}, NO: {}@{}, qty: {}",
+            yes_order.owner, yes_order.price,
+            no_order.owner, no_order.price,
+            match_quantity);
+        
+        // Update YES order
+        yes_order.filled_quantity += match_quantity;
+        yes_order.remaining_quantity -= match_quantity;
+        if yes_order.remaining_quantity == 0 {
+            yes_order.status = OrderStatus::Filled;
+        } else {
+            yes_order.status = OrderStatus::PartiallyFilled;
+        }
+        
+        // Update NO order
+        no_order.filled_quantity += match_quantity;
+        no_order.remaining_quantity -= match_quantity;
+        if no_order.remaining_quantity == 0 {
+            no_order.status = OrderStatus::Filled;
+        } else {
+            no_order.status = OrderStatus::PartiallyFilled;
+        }
+        
+        // Mint shares to respective owners
+        yes_shares.owner = yes_order.owner;
+        yes_shares.market_id = market_id;
+        yes_shares.yes_shares += match_quantity;
+        
+        no_shares.owner = no_order.owner;
+        no_shares.market_id = market_id;
+        no_shares.no_shares += match_quantity;
+        
+        // Update market state
+        market.yes_shares_supply += match_quantity;
+        market.no_shares_supply += match_quantity;
+        market.last_yes_price = yes_order.price;
+        market.last_no_price = no_order.price;
+        
+        // Calculate volume
+        let volume = match_quantity
+            .checked_mul(market.one_dollar_lamports)
+            .ok_or(ErrorCode::MathOverflow)?;
+        market.total_volume_lamports += volume;
+        
+        emit!(OrdersMatched {
+            yes_order_id: yes_order.order_id,
+            no_order_id: no_order.order_id,
+            market_id,
+            yes_owner: yes_order.owner,
+            no_owner: no_order.owner,
+            yes_price: yes_order.price,
+            no_price: no_order.price,
+            quantity: match_quantity,
+        });
+        
+        Ok(())
+    }
+
+    /// Place a sell order for shares
+    /// Debug: Creates sell order and locks shares
+    pub fn place_sell_order(
+        ctx: Context<PlaceSellOrder>,
+        market_id: Pubkey,
+        order_id: Pubkey,
+        side: OrderSide,
+        price: u64,
+        quantity: u64,
+    ) -> Result<()> {
+        let market = &ctx.accounts.market;
+        let user_shares = &mut ctx.accounts.user_shares;
+        let order = &mut ctx.accounts.order;
+        let user = &ctx.accounts.user;
+        
+        require!(market.status == MarketStatus::Active, ErrorCode::MarketNotActive);
+        require!(price > 0 && price < PRICE_PRECISION, ErrorCode::InvalidPrice);
+        require!(quantity > 0, ErrorCode::InvalidAmount);
+        
+        // Verify user has enough shares
+        match side {
+            OrderSide::Yes => {
+                let available = user_shares.yes_shares - user_shares.yes_shares_locked;
+                require!(available >= quantity, ErrorCode::InsufficientShares);
+                user_shares.yes_shares_locked += quantity;
+            },
+            OrderSide::No => {
+                let available = user_shares.no_shares - user_shares.no_shares_locked;
+                require!(available >= quantity, ErrorCode::InsufficientShares);
+                user_shares.no_shares_locked += quantity;
+            },
+        }
+        
+        // Debug: Log sell order
+        msg!("DEBUG: Selling {} {} shares at price {}",
+            quantity,
+            if side == OrderSide::Yes { "YES" } else { "NO" },
+            price);
+        
+        // Create sell order
+        order.order_id = order_id;
+        order.owner = user.key();
+        order.market_id = market_id;
+        order.side = side.clone();
+        order.price = price;
+        order.original_quantity = quantity;
+        order.filled_quantity = 0;
+        order.remaining_quantity = quantity;
+        order.lamports_deposited = 0;
+        order.status = OrderStatus::Open;
+        order.is_sell = true;
+        order.created_at = Clock::get()?.unix_timestamp;
+        
+        emit!(SellOrderPlaced {
+            order_id,
+            owner: user.key(),
+            market_id,
+            side,
+            price,
+            quantity,
+        });
+        
+        Ok(())
+    }
+
+    /// Match sell orders (merge shares)
+    /// When YES seller + NO seller prices sum to $1, burn shares and pay SOL
+    /// Debug: Burns shares and returns SOL to sellers
+    pub fn match_sell_orders(
+        ctx: Context<MatchSellOrders>,
+        market_id: Pubkey,
+    ) -> Result<()> {
+        let market = &mut ctx.accounts.market;
+        let yes_sell = &mut ctx.accounts.yes_sell_order;
+        let no_sell = &mut ctx.accounts.no_sell_order;
+        let yes_shares = &mut ctx.accounts.yes_user_shares;
+        let no_shares = &mut ctx.accounts.no_user_shares;
+        
+        require!(market.status == MarketStatus::Active, ErrorCode::MarketNotActive);
+        require!(yes_sell.is_sell && no_sell.is_sell, ErrorCode::NotASellOrder);
+        require!(yes_sell.side == OrderSide::Yes, ErrorCode::InvalidOrderSide);
+        require!(no_sell.side == OrderSide::No, ErrorCode::InvalidOrderSide);
+        require!(yes_sell.status == OrderStatus::Open || yes_sell.status == OrderStatus::PartiallyFilled, ErrorCode::OrderNotOpen);
+        require!(no_sell.status == OrderStatus::Open || no_sell.status == OrderStatus::PartiallyFilled, ErrorCode::OrderNotOpen);
+        
+        // Core rule: YES price + NO price must equal $1
+        let combined_price = yes_sell.price.checked_add(no_sell.price)
+            .ok_or(ErrorCode::MathOverflow)?;
+        require!(combined_price == PRICE_PRECISION, ErrorCode::PricesMustSumToOne);
+        
+        // Calculate match quantity
+        let match_quantity = std::cmp::min(
+            yes_sell.remaining_quantity,
+            no_sell.remaining_quantity
+        );
+        require!(match_quantity > 0, ErrorCode::NoMatchQuantity);
+        
+        // Debug: Log merge
+        msg!("DEBUG: Merging - YES sell: {}@{}, NO sell: {}@{}, qty: {}",
+            yes_sell.owner, yes_sell.price,
+            no_sell.owner, no_sell.price,
+            match_quantity);
+        
+        // Calculate payouts
+        let yes_payout = yes_sell.price
+            .checked_mul(match_quantity)
+            .ok_or(ErrorCode::MathOverflow)?
+            .checked_mul(market.one_dollar_lamports)
+            .ok_or(ErrorCode::MathOverflow)?
+            .checked_div(PRICE_PRECISION)
+            .ok_or(ErrorCode::MathOverflow)?;
+        
+        let no_payout = no_sell.price
+            .checked_mul(match_quantity)
+            .ok_or(ErrorCode::MathOverflow)?
+            .checked_mul(market.one_dollar_lamports)
+            .ok_or(ErrorCode::MathOverflow)?
+            .checked_div(PRICE_PRECISION)
+            .ok_or(ErrorCode::MathOverflow)?;
+        
+        // Burn shares
+        yes_shares.yes_shares -= match_quantity;
+        yes_shares.yes_shares_locked -= match_quantity;
+        no_shares.no_shares -= match_quantity;
+        no_shares.no_shares_locked -= match_quantity;
+        
+        // Update orders
+        yes_sell.filled_quantity += match_quantity;
+        yes_sell.remaining_quantity -= match_quantity;
+        if yes_sell.remaining_quantity == 0 {
+            yes_sell.status = OrderStatus::Filled;
+        } else {
+            yes_sell.status = OrderStatus::PartiallyFilled;
+        }
+        
+        no_sell.filled_quantity += match_quantity;
+        no_sell.remaining_quantity -= match_quantity;
+        if no_sell.remaining_quantity == 0 {
+            no_sell.status = OrderStatus::Filled;
+        } else {
+            no_sell.status = OrderStatus::PartiallyFilled;
+        }
+        
+        // Update market
+        market.yes_shares_supply -= match_quantity;
+        market.no_shares_supply -= match_quantity;
+        
+        // Transfer SOL from vault to sellers
+        **ctx.accounts.vault.try_borrow_mut_lamports()? -= yes_payout + no_payout;
+        **ctx.accounts.yes_seller.try_borrow_mut_lamports()? += yes_payout;
+        **ctx.accounts.no_seller.try_borrow_mut_lamports()? += no_payout;
+        
+        emit!(SharesMerged {
+            yes_order_id: yes_sell.order_id,
+            no_order_id: no_sell.order_id,
+            market_id,
+            yes_seller: yes_sell.owner,
+            no_seller: no_sell.owner,
+            quantity: match_quantity,
+            yes_payout,
+            no_payout,
+        });
+        
+        Ok(())
+    }
+
+    /// Cancel an open order and refund SOL
+    /// Debug: Returns deposited SOL to user
+    pub fn cancel_order(
+        ctx: Context<CancelOrder>,
+        _market_id: Pubkey,
+    ) -> Result<()> {
+        let order = &mut ctx.accounts.order;
+        let user = &ctx.accounts.user;
+        
+        require!(order.owner == user.key(), ErrorCode::Unauthorized);
+        require!(
+            order.status == OrderStatus::Open || order.status == OrderStatus::PartiallyFilled,
+            ErrorCode::OrderNotCancellable
+        );
+        
+        if order.is_sell {
+            // Unlock shares for sell orders
+            let user_shares = &mut ctx.accounts.user_shares;
+            match order.side {
+                OrderSide::Yes => {
+                    user_shares.yes_shares_locked -= order.remaining_quantity;
+                },
+                OrderSide::No => {
+                    user_shares.no_shares_locked -= order.remaining_quantity;
+                },
+            }
+        } else {
+            // Refund SOL for buy orders
+            let refund_ratio = order.remaining_quantity as u128 * 1_000_000 / order.original_quantity as u128;
+            let refund_lamports = (order.lamports_deposited as u128 * refund_ratio / 1_000_000) as u64;
+            
+            // Debug: Log refund
+            msg!("DEBUG: Refunding {} lamports for cancelled order", refund_lamports);
+            
+            **ctx.accounts.vault.try_borrow_mut_lamports()? -= refund_lamports;
+            **user.try_borrow_mut_lamports()? += refund_lamports;
+        }
+        
+        order.status = OrderStatus::Cancelled;
+        
+        emit!(OrderCancelled {
+            order_id: order.order_id,
+            owner: user.key(),
+        });
+        
+        Ok(())
+    }
+
+    /// Resolve market and set winning outcome
+    /// Debug: Marks market as resolved with winner
+    pub fn resolve_market(
+        ctx: Context<ResolveMarket>,
+        market_id: Pubkey,
+        winning_outcome: MarketOutcome,
+    ) -> Result<()> {
+        let market = &mut ctx.accounts.market;
+        
+        require!(market.status == MarketStatus::Active, ErrorCode::MarketNotActive);
+        require!(
+            ctx.accounts.authority.key() == market.authority,
+            ErrorCode::Unauthorized
+        );
+        require!(
+            winning_outcome == MarketOutcome::Yes || winning_outcome == MarketOutcome::No,
+            ErrorCode::InvalidOutcome
+        );
+        
+        market.status = MarketStatus::Resolved;
+        market.winning_outcome = winning_outcome.clone();
+        market.resolved_at = Clock::get()?.unix_timestamp;
+        
+        // Debug: Log resolution
+        msg!("DEBUG: Market {:?} resolved with outcome {:?}", market_id, winning_outcome);
+        
+        emit!(MarketResolved {
+            market_id,
+            winning_outcome,
+            resolved_at: market.resolved_at,
+        });
+        
+        Ok(())
+    }
+
+    /// Redeem winning shares after market resolution
+    /// Winners get $1 worth of SOL per share, losers get $0
+    /// Debug: Pays out winners in SOL
+    pub fn redeem_shares(
+        ctx: Context<RedeemShares>,
+        market_id: Pubkey,
+    ) -> Result<()> {
+        let market = &ctx.accounts.market;
+        let user_shares = &mut ctx.accounts.user_shares;
+        let user = &ctx.accounts.user;
+        
+        require!(market.status == MarketStatus::Resolved, ErrorCode::MarketNotResolved);
+        require!(user_shares.owner == user.key(), ErrorCode::Unauthorized);
+        
+        let shares_to_redeem = match market.winning_outcome {
+            MarketOutcome::Yes => user_shares.yes_shares,
+            MarketOutcome::No => user_shares.no_shares,
+            MarketOutcome::Pending => return Err(ErrorCode::MarketNotResolved.into()),
+        };
+        
+        require!(shares_to_redeem > 0, ErrorCode::NoSharesToRedeem);
+        
+        // Winning shares are worth $1 each in SOL
+        let payout = shares_to_redeem
+            .checked_mul(market.one_dollar_lamports)
+            .ok_or(ErrorCode::MathOverflow)?;
+        
+        // Debug: Log redemption
+        msg!("DEBUG: Redeeming {} shares for {} lamports",
+            shares_to_redeem, payout);
+        
+        // Zero out winning shares
+        match market.winning_outcome {
+            MarketOutcome::Yes => user_shares.yes_shares = 0,
+            MarketOutcome::No => user_shares.no_shares = 0,
+            MarketOutcome::Pending => {},
+        }
+        
+        // Transfer payout from vault to user
+        **ctx.accounts.vault.try_borrow_mut_lamports()? -= payout;
+        **user.try_borrow_mut_lamports()? += payout;
+        
+        emit!(SharesRedeemed {
+            owner: user.key(),
+            market_id,
+            winning_outcome: market.winning_outcome.clone(),
+            shares_redeemed: shares_to_redeem,
+            payout_lamports: payout,
+        });
+        
+        Ok(())
+    }
+
+    pub fn parimutuel_initialize_market(
+        ctx: Context<parimutuel::InitializeMarket>,
+        market_seed: String,
+        oracle_authority: Pubkey,
+        token_mint: Pubkey,
+        target_market_cap: u64,
+        deadline: i64,
+    ) -> Result<()> {
+        parimutuel::initialize_market(ctx, market_seed, oracle_authority, token_mint, target_market_cap, deadline)
+    }
+
+    pub fn parimutuel_place_bet(
+        ctx: Context<parimutuel::PlaceBet>,
+        market_seed: String,
+        amount: u64,
+        side: bool,
+    ) -> Result<()> {
+        parimutuel::place_bet(ctx, market_seed, amount, side)
+    }
+
+    pub fn parimutuel_resolve_market(
+        ctx: Context<parimutuel::ResolveMarket>,
+        market_seed: String,
+        current_market_cap: u64,
+        timestamp: i64,
+    ) -> Result<()> {
+        parimutuel::resolve_market(ctx, market_seed, current_market_cap, timestamp)
+    }
+
+    pub fn parimutuel_claim_reward(
+        ctx: Context<parimutuel::ClaimReward>,
+        market_seed: String,
+    ) -> Result<()> {
+        parimutuel::claim_reward(ctx, market_seed)
+    }
+}
+
+// ============================================================================
+// Account Structures
+// ============================================================================
+
+#[account]
+pub struct Market {
+    pub authority: Pubkey,
+    pub market_id: Pubkey,
+    pub token_mint: Pubkey,
+    pub target_market_cap: u64,
+    pub current_market_cap: u64,
+    pub expiry_time: i64,
+    pub question: String,
+    pub status: MarketStatus,
+    pub winning_outcome: MarketOutcome,
+    pub yes_shares_supply: u64,
+    pub no_shares_supply: u64,
+    pub yes_order_count: u64,
+    pub no_order_count: u64,
+    pub total_volume_lamports: u64,
+    pub last_yes_price: u64,         // Last matched YES price (in PRICE_PRECISION)
+    pub last_no_price: u64,          // Last matched NO price (in PRICE_PRECISION)
+    pub one_dollar_lamports: u64,    // SOL equivalent of $1
+    pub created_at: i64,
+    pub resolved_at: i64,
+}
+
+#[account]
+pub struct Order {
+    pub order_id: Pubkey,
+    pub owner: Pubkey,
+    pub market_id: Pubkey,
+    pub side: OrderSide,
+    pub price: u64,                  // Price in PRICE_PRECISION units
+    pub original_quantity: u64,
+    pub filled_quantity: u64,
+    pub remaining_quantity: u64,
+    pub lamports_deposited: u64,
+    pub status: OrderStatus,
+    pub is_sell: bool,
+    pub created_at: i64,
+}
+
+#[account]
+pub struct UserShares {
+    pub owner: Pubkey,
+    pub market_id: Pubkey,
+    pub yes_shares: u64,
+    pub no_shares: u64,
+    pub yes_shares_locked: u64,      // Locked in pending sell orders
+    pub no_shares_locked: u64,       // Locked in pending sell orders
+}
+
+// ============================================================================
+// Enums
+// ============================================================================
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq, Debug)]
+pub enum MarketStatus {
+    Active,
+    Resolved,
+    Cancelled,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq, Debug)]
+pub enum MarketOutcome {
+    Pending,
+    Yes,
+    No,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq, Debug)]
+pub enum OrderSide {
+    Yes,
+    No,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq, Debug)]
+pub enum OrderStatus {
+    Open,
+    PartiallyFilled,
+    Filled,
+    Cancelled,
+}
+
+// ============================================================================
+// Context Structs
+// ============================================================================
+
+#[derive(Accounts)]
+#[instruction(market_id: Pubkey)]
+pub struct InitializeMarket<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + 32 + 32 + 32 + 8 + 8 + 8 + 256 + 1 + 1 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8,
+        seeds = [b"market", market_id.as_ref()],
+        bump
+    )]
+    pub market: Account<'info, Market>,
+    
+    /// CHECK: Vault PDA for holding SOL collateral
+    #[account(
+        mut,
+        seeds = [b"vault", market_id.as_ref()],
+        bump
+    )]
+    pub vault: AccountInfo<'info>,
+    
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(market_id: Pubkey)]
+pub struct UpdateSolPrice<'info> {
+    pub authority: Signer<'info>,
+    
+    #[account(
+        mut,
+        seeds = [b"market", market_id.as_ref()],
+        bump
+    )]
+    pub market: Account<'info, Market>,
+}
+
+#[derive(Accounts)]
+#[instruction(market_id: Pubkey, order_id: Pubkey)]
+pub struct PlaceOrder<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    
+    #[account(
+        mut,
+        seeds = [b"market", market_id.as_ref()],
+        bump
+    )]
+    pub market: Account<'info, Market>,
+    
+    #[account(
+        init,
+        payer = user,
+        space = 8 + 32 + 32 + 32 + 1 + 8 + 8 + 8 + 8 + 8 + 1 + 1 + 8,
+        seeds = [b"order", order_id.as_ref()],
+        bump
+    )]
+    pub order: Account<'info, Order>,
+    
+    /// CHECK: Vault for SOL collateral
+    #[account(
+        mut,
+        seeds = [b"vault", market_id.as_ref()],
+        bump
+    )]
+    pub vault: AccountInfo<'info>,
+    
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(market_id: Pubkey)]
+pub struct MatchOrders<'info> {
+    #[account(
+        mut,
+        seeds = [b"market", market_id.as_ref()],
+        bump
+    )]
+    pub market: Account<'info, Market>,
+    
+    #[account(mut)]
+    pub yes_order: Account<'info, Order>,
+    
+    #[account(mut)]
+    pub no_order: Account<'info, Order>,
+    
+    #[account(
+        init_if_needed,
+        payer = matcher,
+        space = 8 + 32 + 32 + 8 + 8 + 8 + 8,
+        seeds = [b"shares", yes_order.owner.as_ref(), market_id.as_ref()],
+        bump
+    )]
+    pub yes_user_shares: Account<'info, UserShares>,
+    
+    #[account(
+        init_if_needed,
+        payer = matcher,
+        space = 8 + 32 + 32 + 8 + 8 + 8 + 8,
+        seeds = [b"shares", no_order.owner.as_ref(), market_id.as_ref()],
+        bump
+    )]
+    pub no_user_shares: Account<'info, UserShares>,
+    
+    #[account(mut)]
+    pub matcher: Signer<'info>,
+    
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(market_id: Pubkey, order_id: Pubkey)]
+pub struct PlaceSellOrder<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    
+    #[account(
+        seeds = [b"market", market_id.as_ref()],
+        bump
+    )]
+    pub market: Account<'info, Market>,
+    
+    #[account(
+        mut,
+        seeds = [b"shares", user.key().as_ref(), market_id.as_ref()],
+        bump
+    )]
+    pub user_shares: Account<'info, UserShares>,
+    
+    #[account(
+        init,
+        payer = user,
+        space = 8 + 32 + 32 + 32 + 1 + 8 + 8 + 8 + 8 + 8 + 1 + 1 + 8,
+        seeds = [b"order", order_id.as_ref()],
+        bump
+    )]
+    pub order: Account<'info, Order>,
+    
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(market_id: Pubkey)]
+pub struct MatchSellOrders<'info> {
+    #[account(
+        mut,
+        seeds = [b"market", market_id.as_ref()],
+        bump
+    )]
+    pub market: Account<'info, Market>,
+    
+    #[account(mut)]
+    pub yes_sell_order: Account<'info, Order>,
+    
+    #[account(mut)]
+    pub no_sell_order: Account<'info, Order>,
+    
+    #[account(mut)]
+    pub yes_user_shares: Account<'info, UserShares>,
+    
+    #[account(mut)]
+    pub no_user_shares: Account<'info, UserShares>,
+    
+    /// CHECK: Vault for SOL
+    #[account(
+        mut,
+        seeds = [b"vault", market_id.as_ref()],
+        bump
+    )]
+    pub vault: AccountInfo<'info>,
+    
+    /// CHECK: YES seller receives SOL
+    #[account(mut)]
+    pub yes_seller: AccountInfo<'info>,
+    
+    /// CHECK: NO seller receives SOL
+    #[account(mut)]
+    pub no_seller: AccountInfo<'info>,
+    
+    #[account(mut)]
+    pub matcher: Signer<'info>,
+    
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(market_id: Pubkey)]
+pub struct CancelOrder<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    
+    #[account(mut)]
+    pub order: Account<'info, Order>,
+    
+    #[account(
+        mut,
+        seeds = [b"shares", user.key().as_ref(), market_id.as_ref()],
+        bump
+    )]
+    pub user_shares: Account<'info, UserShares>,
+    
+    /// CHECK: Vault for SOL refund
+    #[account(
+        mut,
+        seeds = [b"vault", market_id.as_ref()],
+        bump
+    )]
+    pub vault: AccountInfo<'info>,
+}
+
+#[derive(Accounts)]
+#[instruction(market_id: Pubkey)]
+pub struct ResolveMarket<'info> {
+    pub authority: Signer<'info>,
+    
+    #[account(
+        mut,
+        seeds = [b"market", market_id.as_ref()],
+        bump
+    )]
+    pub market: Account<'info, Market>,
+}
+
+#[derive(Accounts)]
+#[instruction(market_id: Pubkey)]
+pub struct RedeemShares<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    
+    #[account(
+        seeds = [b"market", market_id.as_ref()],
+        bump
+    )]
+    pub market: Account<'info, Market>,
+    
+    #[account(
+        mut,
+        seeds = [b"shares", user.key().as_ref(), market_id.as_ref()],
+        bump
+    )]
+    pub user_shares: Account<'info, UserShares>,
+    
+    /// CHECK: Vault for payout
+    #[account(
+        mut,
+        seeds = [b"vault", market_id.as_ref()],
+        bump
+    )]
+    pub vault: AccountInfo<'info>,
+}
+
+// ============================================================================
+// Error Codes
+// ============================================================================
+
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Unauthorized access")]
+    Unauthorized,
+    #[msg("Market is not active")]
+    MarketNotActive,
+    #[msg("Market has expired")]
+    MarketExpired,
+    #[msg("Market is not resolved")]
+    MarketNotResolved,
+    #[msg("Invalid amount")]
+    InvalidAmount,
+    #[msg("Invalid price - must be between 0 and $1")]
+    InvalidPrice,
+    #[msg("YES price + NO price must equal $1")]
+    PricesMustSumToOne,
+    #[msg("Invalid order side")]
+    InvalidOrderSide,
+    #[msg("Order is not open")]
+    OrderNotOpen,
+    #[msg("Order is not cancellable")]
+    OrderNotCancellable,
+    #[msg("Market mismatch")]
+    MarketMismatch,
+    #[msg("No quantity to match")]
+    NoMatchQuantity,
+    #[msg("Insufficient shares")]
+    InsufficientShares,
+    #[msg("Not a sell order")]
+    NotASellOrder,
+    #[msg("No shares to redeem")]
+    NoSharesToRedeem,
+    #[msg("Invalid outcome")]
+    InvalidOutcome,
+    #[msg("Math overflow")]
+    MathOverflow,
+}
+
+// ============================================================================
+// Events
+// ============================================================================
+
+#[event]
+pub struct MarketInitialized {
+    pub market_id: Pubkey,
+    pub authority: Pubkey,
+    pub token_mint: Pubkey,
+    pub target_market_cap: u64,
+    pub expiry_time: i64,
+    pub one_dollar_lamports: u64,
+}
+
+#[event]
+pub struct SolPriceUpdated {
+    pub market_id: Pubkey,
+    pub old_lamports_per_dollar: u64,
+    pub new_lamports_per_dollar: u64,
+}
+
+#[event]
+pub struct OrderPlaced {
+    pub order_id: Pubkey,
+    pub owner: Pubkey,
+    pub market_id: Pubkey,
+    pub side: OrderSide,
+    pub price: u64,
+    pub quantity: u64,
+    pub cost_lamports: u64,
+}
+
+#[event]
+pub struct OrdersMatched {
+    pub yes_order_id: Pubkey,
+    pub no_order_id: Pubkey,
+    pub market_id: Pubkey,
+    pub yes_owner: Pubkey,
+    pub no_owner: Pubkey,
+    pub yes_price: u64,
+    pub no_price: u64,
+    pub quantity: u64,
+}
+
+#[event]
+pub struct SellOrderPlaced {
+    pub order_id: Pubkey,
+    pub owner: Pubkey,
+    pub market_id: Pubkey,
+    pub side: OrderSide,
+    pub price: u64,
+    pub quantity: u64,
+}
+
+#[event]
+pub struct SharesMerged {
+    pub yes_order_id: Pubkey,
+    pub no_order_id: Pubkey,
+    pub market_id: Pubkey,
+    pub yes_seller: Pubkey,
+    pub no_seller: Pubkey,
+    pub quantity: u64,
+    pub yes_payout: u64,
+    pub no_payout: u64,
+}
+
+#[event]
+pub struct OrderCancelled {
+    pub order_id: Pubkey,
+    pub owner: Pubkey,
+}
+
+#[event]
+pub struct MarketResolved {
+    pub market_id: Pubkey,
+    pub winning_outcome: MarketOutcome,
+    pub resolved_at: i64,
+}
+
+#[event]
+pub struct SharesRedeemed {
+    pub owner: Pubkey,
+    pub market_id: Pubkey,
+    pub winning_outcome: MarketOutcome,
+    pub shares_redeemed: u64,
+    pub payout_lamports: u64,
+}

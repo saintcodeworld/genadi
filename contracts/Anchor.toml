@@ -1,0 +1,36 @@
+[toolchain]
+anchor_version = "0.32.1"
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.localnet]
+mememarket = "CbDHViyDGxLz4Xc11wZmdAoqAKWUmwgXLrtzJ6sSZHT7"
+
+[programs.devnet]
+mememarket = "CbDHViyDGxLz4Xc11wZmdAoqAKWUmwgXLrtzJ6sSZHT7"
+
+[programs.mainnet]
+mememarket = "CbDHViyDGxLz4Xc11wZmdAoqAKWUmwgXLrtzJ6sSZHT7"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "devnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "yarn run ts-mocha -p ./tsconfig.json tests/**/*.ts"
+deploy = "anchor deploy"
+
+[test]
+startup_wait = 5000
+upgradeable = false
+
+[test.validator]
+url = "https://api.devnet.solana.com"
+
+[[test.validator.clone]]
+address = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"  # USDC Devnet

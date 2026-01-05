@@ -1,0 +1,80 @@
+version: '3.8'
+
+services:
+  # Redis - Cache and message broker
+  redis:
+    image: redis:7-alpine
+    container_name: mememarket-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - mememarket-network
+
+  # Python FastAPI Backend
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: mememarket-backend
+    ports:
+      - "8001:8001"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - SOLANA_RPC_URL=https://api.devnet.solana.com
+      - PROGRAM_ID=CbDHViyDGxLz4Xc11wZmdAoqAKWUmwgXLrtzJ6sSZHT7
+      - ENVIRONMENT=development
+      - HOST=0.0.0.0
+      - PORT=8001
+    volumes:
+      - ./backend:/app
+      - /app/__pycache__
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - mememarket-network
+    command: uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+
+  # TypeScript Crank (Oracle)
+  crank:
+    build:
+      context: ./contracts/crank
+      dockerfile: Dockerfile
+    container_name: mememarket-crank
+    environment:
+      - RPC_URL=https://api.devnet.solana.com
+      - PROGRAM_ID=CbDHViyDGxLz4Xc11wZmdAoqAKWUmwgXLrtzJ6sSZHT7
+      - ORACLE_KEYPAIR_PATH=/root/.config/solana/id.json
+      - IDL_PATH=../target/idl/mememarket.json
+      - CHECK_INTERVAL_MS=60000
+      - MAX_RETRIES=3
+      - RETRY_DELAY_MS=5000
+    volumes:
+      - ./contracts/crank:/app
+      - ./contracts/target:/app/../target:ro
+      - ~/.config/solana/id.json:/root/.config/solana/id.json:ro
+      - /app/node_modules
+    depends_on:
+      - redis
+      - backend
+    restart: unless-stopped
+    networks:
+      - mememarket-network
+
+networks:
+  mememarket-network:
+    driver: bridge
+
+volumes:
+  redis-data:
+    driver: local

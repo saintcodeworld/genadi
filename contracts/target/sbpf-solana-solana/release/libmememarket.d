@@ -1,0 +1,1 @@
+/Users/saintcodeworld/Desktop/polymarket/contracts/target/sbpf-solana-solana/release/libmememarket.rlib: /Users/saintcodeworld/Desktop/polymarket/contracts/programs/mememarket/src/lib.rs /Users/saintcodeworld/Desktop/polymarket/contracts/programs/mememarket/src/parimutuel.rs

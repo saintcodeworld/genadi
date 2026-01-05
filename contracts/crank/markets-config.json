@@ -1,0 +1,11 @@
+{
+  "markets": [
+    {
+      "marketSeed": "btc_100k_24h",
+      "tokenMint": "So11111111111111111111111111111111111111112",
+      "targetMarketCap": 1000000000000,
+      "deadline": 1704499200,
+      "checkIntervalMs": 60000
+    }
+  ]
+}
